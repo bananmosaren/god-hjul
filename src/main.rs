@@ -1,6 +1,8 @@
 use bevy::prelude::*;
 use bevy::input::keyboard::KeyCode;
+use bevy::window::{WindowMode, PrimaryWindow};
 use std::f32::consts::TAU;
+use std::time::{Instant, Duration};
 use avian3d::prelude::*;
 use rand::Rng;
 use rand::rng;
@@ -8,12 +10,34 @@ use rand::prelude::IndexedRandom;
 
 fn main() {
     App::new()
-        .add_plugins((DefaultPlugins, PhysicsPlugins::default()))
+        .add_plugins((
+            PhysicsPlugins::default(),
+            DefaultPlugins.set(
+                WindowPlugin {
+                    primary_window: Some(Window {
+                        resizable: false,
+                        mode: WindowMode::Fullscreen(MonitorSelection::Primary, VideoModeSelection::Current),
+                        ..default()
+                    }),
+                    ..default()
+                }
+            )
+        ))
         .insert_resource(Score(0))
         .insert_resource(EnemyCount(0))
         .insert_resource(ClearColor(Color::srgb(0.5, 0.5, 0.9)))
+        .insert_resource(AmbientLight::NONE)
         .add_systems(Startup, setup)
-        .add_systems(Update, (player_movement, camera_movement, spawn_enemies, enemy_movement, hit_wall, overlay))
+        .add_systems(Update, (
+            player_movement,
+            camera_movement,
+            spawn_enemies,
+            enemy_movement,
+            hit_wall,
+            overlay,
+            remove_explosions,
+            remove_banner,
+        ))
         .run();
 }
 
@@ -29,10 +53,36 @@ struct Enemy;
 #[derive(Component)]
 struct Car;
 
+#[derive(Component)]
+struct Banner {
+    time: Instant,
+}
+
+#[derive(Component)]
+struct Explosion {
+    time: Instant,
+}
+
+#[derive(Component)]
+struct Map;
+
+
 fn setup(
     mut commands: Commands,
-    assets: ResMut<AssetServer>
+    assets: ResMut<AssetServer>,
+    window: Query<&Window, With<PrimaryWindow>>,
 ) {
+
+    // Intro
+    commands.spawn(Camera2d::default());
+    commands.spawn((Sprite {
+        image: assets.load("textures/banner.png"),
+        custom_size: Some(window.iter().next().unwrap().size()),
+        ..default()
+    }, Banner {
+                        time: Instant::now()
+                    }));
+
     // Ground
     let map_scene = assets.load("models/map/map.glb#Scene0");
 
@@ -40,8 +90,45 @@ fn setup(
         RigidBody::Static,
         ColliderConstructorHierarchy::new(ColliderConstructor::TrimeshFromMesh),
         SceneRoot(map_scene.clone()),
-        Transform::from_xyz(0.0, -1.0, 0.0)
+        Transform::from_xyz(0.0, -1.0, 0.0),
+        Map
     ));
+
+    // Music
+    commands.spawn((
+        AudioPlayer::new(assets.load("audio/bjallerklang_av_jack.ogg")),
+        PlaybackSettings::LOOP
+    ));
+
+    // UI
+    commands.spawn((
+        Text::default(),
+        TextFont {
+            font_size: 25.0,
+            ..Default::default()
+        },
+        TextColor(Color::srgb(0.9, 0.1, 0.8).into()),
+    ));
+
+
+    // Light
+    commands.spawn((
+            PointLight {
+                shadows_enabled: true,
+                color: bevy::prelude::Color::Srgba(Srgba::rgb(1.0, 1.0, 0.0)),
+                range: 1000_00000000000.0,
+                intensity: 1000_0000.0,
+                radius: 100_00000000000.0,
+                ..Default::default()
+            },
+        Transform::from_xyz(0.0, 10.0, 0.0))
+    );
+}
+
+fn start(
+    assets: &ResMut<AssetServer>,
+    commands: &mut Commands,
+) {
 
     // Player
     let car1_scene = assets.load("models/cars/car1.glb#Scene0");
@@ -61,6 +148,7 @@ fn setup(
         LockedAxes::new()
             .lock_rotation_x()
             .lock_rotation_z(),
+        CollisionEventsEnabled,
         Player,
         Car
     ));
@@ -71,23 +159,15 @@ fn setup(
         Transform::from_xyz(player_pos.x, player_pos.y + 3.0, player_pos.z - 16.0)
             .with_rotation(Quat::from_rotation_x(60_f32.to_radians()))
             .with_rotation(Quat::from_rotation_y(180_f32.to_radians())),
-        PlayerCamera
-    ));
-
-    // Music
-    commands.spawn((
-        AudioPlayer::new(assets.load("audio/bjallerklang_av_jack.ogg")),
-        PlaybackSettings::LOOP
-    ));
-
-    // UI
-    commands.spawn((
-        Text::default(),
-        TextFont {
-            font_size: 25.0,
-            ..Default::default()
+        DistanceFog {
+            color: Color::WHITE,
+            falloff: FogFalloff::Linear {
+                start: 10.0,
+                end: 100.0,
+            },
+            ..default()
         },
-        TextColor(Color::srgb(0.9, 0.1, 0.8).into()),
+        PlayerCamera
     ));
 }
 
@@ -145,7 +225,7 @@ fn spawn_enemies(
     let car5 = assets.load("models/cars/car5.glb#Scene0");
     let cars = vec![car2, car3, car4, car5];
 
-    if enemy_count.0 < 5 {
+    if enemy_count.0 < 10 {
         let mut rng = rng();
         let spawn = spawns.choose(&mut rng).unwrap();
         let car = cars.choose(&mut rng).unwrap();
@@ -175,7 +255,11 @@ fn enemy_explode(
     mut commands: Commands,
     assets: ResMut<AssetServer>,
     mut enemy_count: ResMut<EnemyCount>,
-    mut score: ResMut<Score>
+    mut score: ResMut<Score>,
+    enemy_query: Query<&Transform, With<Enemy>>,
+    player: Query<&Transform, With<Player>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>
 ) {
     let enemy_car = event.collider1;
     let player_car = event.collider2;
@@ -184,11 +268,48 @@ fn enemy_explode(
         commands.spawn(
             AudioPlayer::new(assets.load("audio/explode.ogg"))
         );
+        
+        for player_transform in player.iter() {
+            if let Ok(transform) = enemy_query.get(enemy_car) {
+                let texture_handle = assets.load("textures/explosion.png");
 
-        commands.entity(enemy_car).despawn();
+                let material_handle = materials.add(StandardMaterial {
+                    base_color_texture: Some(texture_handle.clone()),
+                    alpha_mode: AlphaMode::Blend,
+                    unlit: true,
+                    ..default()
+                });
+
+                commands.spawn((
+                    Mesh3d(meshes.add(Cuboid::new(10.0, 10.0, 0.0))),
+                    MeshMaterial3d(material_handle),
+                    Transform::from_xyz(transform.translation.x, transform.translation.y, transform.translation.z)
+                        .with_rotation(Quat::from_rotation_y(player_transform.rotation.y)),
+                    Explosion {
+                        time: Instant::now()
+                    }
+                ));
+
+
+            }
+        }
+        
         enemy_count.0 -= 1;
 
         score.0 += 1;
+
+        commands.entity(enemy_car).despawn();
+    }
+}
+
+fn remove_explosions(
+    explosions: Query<(Entity, &Explosion)>,
+    mut commands: Commands,
+) {
+    for (entity, explosion) in explosions.iter() {
+        if explosion.time.elapsed() >= Duration::from_millis(200) {
+            commands.entity(entity).despawn();
+        }
     }
 }
 
@@ -196,8 +317,8 @@ fn enemy_movement(
     mut enemy: Query<(Forces, &mut Transform), With<Enemy>>,
     timer: Res<Time>
 ) {
-    let speed_mov = 10.0;
-    let speed_rot = 0.3;
+    let speed_mov = 5.0;
+    let speed_rot = 0.5;
 
     for (mut forces, mut transform) in enemy.iter_mut() {
         let mut forward = transform.forward().as_vec3();
@@ -216,20 +337,37 @@ fn enemy_movement(
 
 fn hit_wall(
     mut ray_cast: MeshRayCast,
-    mut car: Query<&mut Transform, With<Car>>
+    mut car: Query<&mut Transform, With<Car>>,
+    //map_query: Query<Entity, With<Map>>
 ) {
-    for mut transform in car.iter_mut() {
-        let ray = Ray3d::new(transform.translation, -transform.forward());
-        let hits = ray_cast.cast_ray(ray,
-            &MeshRayCastSettings {
-                visibility: RayCastVisibility::Any,
-                ..Default::default()
+    //for entity in map_query.iter() {
+        for mut transform in car.iter_mut() {
+            let ray = Ray3d::new(transform.translation, -transform.forward());
+            let hits = ray_cast.cast_ray(ray,
+                &MeshRayCastSettings {
+                    visibility: RayCastVisibility::Any,
+                    //filter: &|e| e == entity,
+                    ..Default::default()
+                }
+            );
+            for hit in hits {
+                if hit.1.distance < 2.5 {
+                    transform.rotate_y(180_f32.to_radians());
+                }
             }
-        );
-        for hit in hits {
-            if hit.1.distance < 2.5 {
-                transform.rotate_y(180_f32.to_radians());
-            }
+        }
+    //}
+}
+
+fn remove_banner(
+    assets: ResMut<AssetServer>,
+    banners: Query<(Entity, &Banner)>,
+    mut commands: Commands,
+) {
+    for (entity, banner) in banners.iter() {
+        if banner.time.elapsed() >= Duration::from_secs(2) {
+            commands.entity(entity).despawn();
+            start(&assets, &mut commands);
         }
     }
 }
@@ -239,5 +377,5 @@ fn overlay(
     score: Res<Score>
 ) {
     let score = score.0;
-    text.0 = format!("Poäng: {score}").to_string();
+    text.0 = format!("Poang: {score}").to_string();
 }
